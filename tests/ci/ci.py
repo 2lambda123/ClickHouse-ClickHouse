@@ -1,5 +1,6 @@
 import argparse
 import concurrent.futures
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from enum import Enum
 import json
@@ -48,7 +49,7 @@ from git_helper import GIT_PREFIX, Git
 from git_helper import Runner as GitRunner
 from github import Github
 from pr_info import PRInfo
-from report import SUCCESS, BuildResult, JobReport
+from report import ERROR, SUCCESS, BuildResult, JobReport
 from s3_helper import S3Helper
 from version_helper import get_version_from_repo
 
@@ -88,6 +89,7 @@ class CiCache:
     class RecordType(Enum):
         SUCCESSFUL = "successful"
         PENDING = "pending"
+        FAILED = "failed"
 
     @dataclass
     class Record:
@@ -249,6 +251,13 @@ class CiCache:
         )
         return record
 
+    def print_status(self):
+        for record_type in self.RecordType:
+            GHActions.print_in_group(
+                f"Cache records: [{record_type}]", list(self.records[record_type])
+            )
+        return self
+
     def update(self):
         """
         Pulls cache records from s3. Only records name w/o content.
@@ -260,9 +269,6 @@ class CiCache:
                 path = self.cache_s3_paths[job_type]
                 records = self.s3.list_prefix(f"{path}{prefix}", S3_BUILDS_BUCKET)
                 records = [record.split("/")[-1] for record in records]
-                GHActions.print_in_group(
-                    f"Cache records: [{record_type}] in [{job_type.value}]", records
-                )
                 for file in records:
                     record = self._parse_record_file_name(
                         record_type=record_type, file_name=file
@@ -384,6 +390,9 @@ class CiCache:
             if record_type == self.RecordType.SUCCESSFUL:
                 assert isinstance(status, CommitStatusData)
                 status.dump_to_file(record_file)
+            elif record_type == self.RecordType.FAILED:
+                assert isinstance(status, CommitStatusData)
+                status.dump_to_file(record_file)
             elif record_type == self.RecordType.PENDING:
                 assert isinstance(status, PendingState)
                 with open(record_file, "w") as json_file:
@@ -488,6 +497,16 @@ class CiCache:
             self.RecordType.SUCCESSFUL, job, batch, num_batches, release_branch
         )
 
+    def is_failed(
+        self, job: str, batch: int, num_batches: int, release_branch: bool
+    ) -> bool:
+        """
+        checks if a given job have already been done with failure
+        """
+        return self.exist(
+            self.RecordType.FAILED, job, batch, num_batches, release_branch
+        )
+
     def is_pending(
         self, job: str, batch: int, num_batches: int, release_branch: bool
     ) -> bool:
@@ -495,8 +514,9 @@ class CiCache:
         check pending record in the cache for a given job
         @release_branch - checks that "release" attribute is set for a record
         """
-        if self.is_successful(job, batch, num_batches, release_branch):
-            # successful record is present - not pending
+        if self.is_successful(
+            job, batch, num_batches, release_branch
+        ) or self.is_failed(job, batch, num_batches, release_branch):
             return False
 
         return self.exist(
@@ -517,6 +537,27 @@ class CiCache:
         """
         self.push(
             self.RecordType.SUCCESSFUL,
+            job,
+            [batch],
+            num_batches,
+            job_status,
+            release_branch,
+        )
+
+    def push_failed(
+        self,
+        job: str,
+        batch: int,
+        num_batches: int,
+        job_status: CommitStatusData,
+        release_branch: bool = False,
+    ) -> None:
+        """
+        Pushes a cache record of type Failed (CommitStatusData)
+        @release_branch adds "release" attribute to a record
+        """
+        self.push(
+            self.RecordType.FAILED,
             job,
             [batch],
             num_batches,
@@ -591,46 +632,61 @@ class CiCache:
             bucket=S3_BUILDS_BUCKET, file_path=result_json_path, s3_path=s3_path
         )
 
-    # def await_jobs(self, jobs_with_params: Dict[str, Dict[str, Any]]) -> List[str]:
-    # if not jobs_with_params:
-    #     return []
-    # print(f"Start awaiting jobs [{list(jobs_with_params)}]")
-    # poll_interval_sec = 180
-    # start_at = int(time.time())
-    # TIMEOUT = 3000
-    # expired_sec = 0
-    # done_jobs = []  # type: List[str]
-    # while expired_sec < TIMEOUT and jobs_with_params:
-    #     time.sleep(poll_interval_sec)
-    #     self.update()
-    #     pending_finished: List[str] = []
-    #     for job_name in jobs_with_params:
-    #         num_batches = jobs_with_params[job_name]["num_batches"]
-    #         for batch in jobs_with_params[job_name]["batches"]:
-    #             if self.is_pending(job_name, batch, num_batches):
-    #                 continue
-    #             print(
-    #                 f"Job [{job_name}_[{batch}/{num_batches}]] is not pending anymore"
-    #             )
-    #             pending_finished.append(job_name)
-    #     if pending_finished:
-    #         # restart timer
-    #         start_at = int(time.time())
-    #         expired_sec = 0
-    #         # remove finished jobs from awaiting list
-    #         for job in pending_finished:
-    #             del jobs_with_params[job]
-    #             done_jobs.append(job)
-    #     else:
-    #         expired_sec = int(time.time()) - start_at
-    #     print(f"  ...awaiting continues... time left [{TIMEOUT - expired_sec}]")
-    # if done_jobs:
-    #     print(
-    #         f"Awaiting OK. Left jobs: [{list(jobs_with_params)}], finished jobs: [{done_jobs}]"
-    #     )
-    # else:
-    #     print("Awaiting FAILED. No job has finished.")
-    # return done_jobs
+    def await_jobs(
+        self, jobs_with_params: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, List[int]]:
+        if not jobs_with_params:
+            return {}
+        GHActions.print_in_group("...Awaiting jobs...", list(jobs_with_params))
+        poll_interval_sec = 180
+        start_at = int(time.time())
+        TIMEOUT = 3600
+        expired_sec = 0
+        await_finished: Dict[str, List[int]] = {}
+        while expired_sec < TIMEOUT and jobs_with_params:
+            some_job_ready = False
+            time.sleep(poll_interval_sec)
+            self.update()
+            jobs_with_params_copy = deepcopy(jobs_with_params)
+            for job_name in jobs_with_params:
+                num_batches = jobs_with_params[job_name]["num_batches"]
+                for batch in jobs_with_params[job_name]["batches"]:
+                    if self.is_pending(
+                        job_name, batch, num_batches, release_branch=False
+                    ):
+                        continue
+                    print(
+                        f"Job [{job_name}_[{batch}/{num_batches}]] is not pending anymore"
+                    )
+                    if job_name in await_finished:
+                        await_finished[job_name].append(batch)
+                    else:
+                        await_finished[job_name] = [batch]
+                    some_job_ready = True
+                    jobs_with_params_copy[job_name]["batches"].remove(batch)
+                    if not jobs_with_params_copy[job_name]["batches"]:
+                        del jobs_with_params_copy[job_name]
+            jobs_with_params = jobs_with_params_copy
+            if some_job_ready:
+                pass
+                # restart timer
+                # start_at = int(time.time())
+                # expired_sec = 0
+            else:
+                expired_sec = int(time.time()) - start_at
+            print(f"...awaiting continues... seconds left [{TIMEOUT - expired_sec}]")
+        if await_finished:
+            GHActions.print_in_group(
+                "Finished jobs:",
+                [f"{job}:{batches}" for job, batches in await_finished.items()],
+            )
+        else:
+            print("Awaiting FAILED. No job has finished.")
+        GHActions.print_in_group(
+            "Remaining jobs:",
+            [f"{job}:{params['batches']}" for job, params in jobs_with_params.items()],
+        )
+        return await_finished
 
 
 def get_check_name(check_name: str, batch: int, num_batches: int) -> str:
@@ -883,8 +939,16 @@ def _mark_success_action(
                 job, batch, num_batches, job_status, pr_info.is_release_branch()
             )
             print(f"Job [{job}] is ok")
-        elif job_status:
-            print(f"Job [{job}] is not ok, status [{job_status.status}]")
+        elif job_status and not job_status.is_ok():
+            ci_cache.push_failed(
+                job, batch, num_batches, job_status, pr_info.is_release_branch()
+            )
+            print(f"Job [{job}] is failed with status [{job_status.status}]")
+        else:
+            job_status = CommitStatusData(
+                description="dummy description", status=ERROR, report_url="dummy url"
+            )
+            print(f"No CommitStatusData for [{job}], push dummy failure to ci_cache")
 
 
 def _print_results(result: Any, outfile: Optional[str], pretty: bool = False) -> None:
@@ -1003,7 +1067,8 @@ def _configure_jobs(
     ## b. check what we need to run
     ci_cache = None
     if not ci_cache_disabled:
-        ci_cache = CiCache(s3, digests)
+        ci_cache = CiCache(s3, digests).update()
+        ci_cache.print_status()
 
     jobs_to_wait: Dict[str, Dict[str, Any]] = {}
 
@@ -1131,7 +1196,7 @@ def _update_gh_statuses_action(indata: Dict, s3: S3Helper) -> None:
         print("CI cache is disabled - skip restoring commit statuses from CI cache")
         return
     job_digests = indata["jobs_data"]["digests"]
-    ci_cache = CiCache(s3, job_digests).update().fetch_records_data()
+    ci_cache = CiCache(s3, job_digests).update().fetch_records_data().print_status()
 
     # create GH status
     pr_info = PRInfo()
@@ -1511,28 +1576,34 @@ def main() -> int:
 
         # TODO: await pending jobs
         # wait for pending jobs to be finished, await_jobs is a long blocking call if any job has to be awaited
-        # awaited_jobs = ci_cache.await_jobs(jobs_data.get("jobs_to_wait", {}))
-        # for job in awaited_jobs:
-        #     jobs_to_do = jobs_data["jobs_to_do"]
-        #     if job in jobs_to_do:
-        #         jobs_to_do.remove(job)
-        #     else:
-        #         assert False, "BUG"
-
-        # set planned jobs as pending in the CI cache if on the master
-        if pr_info.is_master() and not args.skip_jobs:
+        if not args.skip_jobs:
             ci_cache = CiCache(s3, jobs_data["digests"])
-            for job in jobs_data["jobs_to_do"]:
-                config = CI_CONFIG.get_job_config(job)
-                if config.run_always or config.run_by_label:
-                    continue
-                job_params = jobs_data["jobs_params"][job]
-                ci_cache.push_pending(
-                    job,
-                    job_params["batches"],
-                    config.num_batches,
-                    release_branch=pr_info.is_release_branch(),
-                )
+            ready_jobs_batches_dict = ci_cache.await_jobs(
+                jobs_data.get("jobs_to_wait", {})
+            )
+            jobs_to_do = jobs_data["jobs_to_do"]
+            jobs_params = jobs_data["jobs_params"]
+            for job, batches in ready_jobs_batches_dict.items():
+                if job in jobs_params:
+                    for batch in batches:
+                        jobs_params[job]["batches"].remove(batch)
+                    if not jobs_params[job]["batches"]:
+                        jobs_to_do.remove(job)
+                        del jobs_params[job]
+
+            # set planned jobs as pending in the CI cache if on the master
+            if pr_info.is_master():
+                for job in jobs_data["jobs_to_do"]:
+                    config = CI_CONFIG.get_job_config(job)
+                    if config.run_always or config.run_by_label:
+                        continue
+                    job_params = jobs_data["jobs_params"][job]
+                    ci_cache.push_pending(
+                        job,
+                        job_params["batches"],
+                        config.num_batches,
+                        release_branch=pr_info.is_release_branch(),
+                    )
 
         # conclude results
         result["git_ref"] = git_ref
