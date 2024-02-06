@@ -792,7 +792,7 @@ CI_CONFIG = CiConfig(
             name=Build.FUZZERS,
             compiler="clang-17",
             package_type="fuzzers",
-            job_config=JobConfig(run_by_label=Labels.libFuzzer)
+            job_config=JobConfig(run_by_label=Labels.libFuzzer),
         ),
     },
     builds_report_config={

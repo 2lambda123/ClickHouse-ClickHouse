@@ -102,15 +102,17 @@ class TestCiCache(unittest.TestCase):
             ci_cache_2.push_pending(job, [0, 1, 2], NUM_BATCHES, release_branch=False)
 
         ### add success status for 0 batch, non-release branch
-        batch=0
+        batch = 0
         for job in JobNames:
-            ci_cache.push_successful(job, batch, NUM_BATCHES, status, release_branch=False)
+            ci_cache.push_successful(
+                job, batch, NUM_BATCHES, status, release_branch=False
+            )
             ci_cache_2.push_successful(
                 job, batch, NUM_BATCHES, status, release_branch=False
             )
 
         ### add failed status for 2 batch, non-release branch
-        batch=2
+        batch = 2
         for job in JobNames:
             ci_cache.push_failed(job, batch, NUM_BATCHES, status, release_branch=False)
             ci_cache_2.push_failed(
